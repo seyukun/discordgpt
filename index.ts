@@ -38,13 +38,7 @@ function buildPartsFromDiscordMessage(
   const parts: any[] = [];
 
   // テキスト部
-  const text = [
-    `from: ${m.author.displayName}`,
-    `time: ${m.createdAt.toISOString()}`,
-    (m.content ?? "").startsWith(prefix)
-      ? (m.content ?? "").slice(prefix.length).trimStart()
-      : (m.content ?? ""),
-  ].join("\n");
+  const text = buildTextFromDiscordMessage(m, prefix);
 
   parts.push({ type: "input_text", text });
 
@@ -79,6 +73,16 @@ function buildPartsFromDiscordMessage(
   return parts;
 }
 
+function buildTextFromDiscordMessage(m: Message, prefix: string) {
+  return [
+    `from: ${m.author.displayName}`,
+    `time: ${m.createdAt.toISOString()}`,
+    (m.content ?? "").startsWith(prefix)
+      ? (m.content ?? "").slice(prefix.length).trimStart()
+      : (m.content ?? ""),
+  ].join("\n");
+}
+
 client.once(Events.ClientReady, (c) => {
   logger.info(`Ready! Logged in as ${c.user.tag}`);
 });
@@ -88,20 +92,26 @@ client.on(Events.MessageCreate, async (message) => {
   if (!client.user) return;
 
   let done = false;
-  (async () => {
-    if (client.user === null) return;
-    let max = 0;
-    while (!done && max++ < 10000) {
-      await message.channel.sendTyping();
-      await sleep(500);
-    }
-  })();
 
   try {
     const prefix = `<@${client.user.id}>`;
 
-    if (message.content.startsWith(prefix)) {
-      const prompt = message.content.slice(prefix.length);
+    if (
+      message.content.startsWith(prefix) ||
+      (await message.fetchReference())?.author.id === client.user.id
+    ) {
+      (async () => {
+        if (client.user === null) return;
+        let max = 0;
+        while (!done && max++ < 10000) {
+          await message.channel.sendTyping();
+          await sleep(500);
+        }
+      })();
+
+      const prompt = message.content.slice(
+        message.content.startsWith(prefix) ? prefix.length : 0,
+      );
       if (prompt.length === 0) return;
 
       // Select the best model for the conversation
@@ -141,7 +151,10 @@ client.on(Events.MessageCreate, async (message) => {
       ].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
       let input = history.map((m) => ({
         role: m.author.id === client.user!.id ? "assistant" : "user",
-        content: buildPartsFromDiscordMessage(m, prefix),
+        content:
+          m.author.id === client.user!.id
+            ? buildTextFromDiscordMessage(m, prefix)
+            : buildPartsFromDiscordMessage(m, prefix),
       })) satisfies OpenAI.Responses.ResponseInput;
 
       for (let attempt = 0; attempt <= 2; attempt++) {
@@ -198,11 +211,13 @@ client.on(Events.MessageCreate, async (message) => {
         }
 
         // If no tool was used, send the final response
-        let didUseTool = response.output.some(
-          (item) =>
-            item.type === "function_call" && item.name === "get_messages",
-        );
-        if (!didUseTool) {
+
+        if (
+          !response.output.some(
+            (item) =>
+              item.type === "function_call" && item.name === "get_messages",
+          )
+        ) {
           await message.reply({ content: response.output_text });
           logger.info({
             model: selectResponse.output_parsed?.model,
@@ -230,7 +245,10 @@ client.on(Events.MessageCreate, async (message) => {
               ].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
               input = history.map((m) => ({
                 role: m.author.id === client.user!.id ? "assistant" : "user",
-                content: buildPartsFromDiscordMessage(m, prefix),
+                content:
+                  m.author.id === client.user!.id
+                    ? buildTextFromDiscordMessage(m, prefix)
+                    : buildPartsFromDiscordMessage(m, prefix),
               })) satisfies OpenAI.Responses.ResponseInput;
             }
           }),
