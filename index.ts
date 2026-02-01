@@ -5,7 +5,6 @@ import { zodTextFormat } from "openai/helpers/zod";
 import z from "zod";
 import { guard } from "@libts/trycatch";
 import { Logger } from "tslog";
-import { sleep } from "bun";
 
 const logger = new Logger();
 
@@ -41,7 +40,7 @@ function buildTextFromDiscordMessage(m: Message, prefix: string) {
   ].join("\n");
 }
 
-function buildPartsFromDiscordMessage(m: Message, prefix: string) {
+async function buildPartsFromDiscordMessage(m: Message, prefix: string) {
   const parts: OpenAI.Responses.ResponseInputContent[] = [];
 
   parts.push({
@@ -49,22 +48,35 @@ function buildPartsFromDiscordMessage(m: Message, prefix: string) {
     text: buildTextFromDiscordMessage(m, prefix),
   });
 
-  [...m.attachments.values()]
-    .slice(0, 10)
-    .map(
-      (f): OpenAI.Responses.ResponseInputContent =>
-        f.contentType?.startsWith("image/")
-          ? {
-              type: "input_image",
-              image_url: f.url,
-              detail: "auto",
-            }
-          : {
-              type: "input_file",
-              file_url: f.url,
-            },
+  (
+    await Promise.all(
+      [...m.attachments.values()]
+        .slice(0, 10)
+        .map(async (f): Promise<OpenAI.Responses.ResponseInputContent> => {
+          return f.contentType?.startsWith("image/")
+            ? {
+                type: "input_image",
+                image_url: f.url,
+                detail: "auto",
+              }
+            : f.contentType?.startsWith("text/")
+              ? {
+                  type: "input_text",
+                  text: [
+                    `from: ${m.author.displayName}`,
+                    `time: ${m.createdAt.toISOString()}`,
+                    `filename: ${f.name}`,
+                    `content:`,
+                    await fetch(f.url).then((res) => res.text()),
+                  ].join("\n"),
+                }
+              : {
+                  type: "input_file",
+                  file_url: f.url,
+                };
+        }),
     )
-    .forEach((part) => parts.push(part));
+  ).forEach((part) => parts.push(part));
 
   return parts;
 }
@@ -77,32 +89,25 @@ client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
   if (!client.user) return;
 
-  let doneCtx = false;
-
-  try {
-    const prefix = `<@${client.user.id}>`;
-
-    if (
-      message.content.startsWith(prefix) ||
-      (message.reference !== null &&
-        (await message.fetchReference())?.author.id === client.user.id)
-    ) {
-      (async () => {
-        if (client.user === null) return;
-        let max = 0;
-        while (!doneCtx && max++ < 10000) {
-          await message.channel.sendTyping();
-          await sleep(100);
-        }
-      })();
-
+  const prefix = `<@${client.user.id}>`;
+  if (
+    message.content.startsWith(prefix) ||
+    (message.reference !== null &&
+      (await message.fetchReference())?.author.id === client.user.id)
+  ) {
+    const typingInterval = setInterval(
+      () => message.channel.sendTyping(),
+      3000,
+    );
+    try {
       const prompt = message.content.slice(
         message.content.startsWith(prefix) ? prefix.length : 0,
       );
       if (prompt.length === 0) return;
 
       // Select the best model for the conversation
-      const [selectResponse, selectError] = await guard(() =>
+      logger.debug("Selecting model...");
+      const [selectResponse, selectError] = await guard(async () =>
         openai.responses.parse({
           model: "gpt-5-nano",
           input: [
@@ -116,7 +121,7 @@ client.on(Events.MessageCreate, async (message) => {
             },
             {
               role: "user",
-              content: buildPartsFromDiscordMessage(message, prefix),
+              content: await buildPartsFromDiscordMessage(message, prefix),
             },
           ],
           text: {
@@ -128,6 +133,7 @@ client.on(Events.MessageCreate, async (message) => {
         logger.error("Error selecting model:", selectError);
         return await message.reply(selectError.message);
       }
+      logger.info("Selected model:", selectResponse.output_parsed?.model);
 
       // Generate the response using the selected model
       let history = [
@@ -141,15 +147,21 @@ client.on(Events.MessageCreate, async (message) => {
           })
         ).values(),
       ].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-      let input = history.map((m) => ({
-        role: m.author.id === client.user!.id ? "assistant" : "user",
-        content:
-          m.author.id === client.user!.id
-            ? buildTextFromDiscordMessage(m, prefix)
-            : buildPartsFromDiscordMessage(m, prefix),
-      })) satisfies OpenAI.Responses.ResponseInput;
 
       for (let attempt = 0; attempt <= 2; attempt++) {
+        // Build the input
+        logger.debug("Building input...");
+        let input = (await Promise.all(
+          history.map(async (m) => ({
+            role: m.author.id === client.user!.id ? "assistant" : "user",
+            content:
+              m.author.id === client.user!.id
+                ? await buildTextFromDiscordMessage(m, prefix)
+                : await buildPartsFromDiscordMessage(m, prefix),
+          })),
+        )) satisfies OpenAI.Responses.ResponseInput;
+
+        logger.debug("Generating response...");
         const [response, error] = await guard(() =>
           openai.responses.create({
             model: selectResponse.output_parsed?.model ?? modelList[0],
@@ -210,17 +222,26 @@ client.on(Events.MessageCreate, async (message) => {
               item.type === "function_call" && item.name === "get_messages",
           )
         ) {
-          await message.reply({ content: response.output_text });
+          for (let i = 0; i < response.output_text.length; i += 2000) {
+            if (i === 0)
+              await message.reply({
+                content: response.output_text.slice(i, i + 2000),
+              });
+            else
+              await message.channel.send({
+                content: response.output_text.slice(i, i + 2000),
+              });
+          }
+
           logger.info({
             model: selectResponse.output_parsed?.model,
-            history: history.map((h) => ({
-              user: h.author.displayName,
-              content: h.content,
-            })),
+            input,
             response: response.output_text,
           });
           return;
         }
+
+        logger.debug("Processing tool calls: Picking up more history");
 
         // Process tool calls
         await Promise.all(
@@ -235,25 +256,19 @@ client.on(Events.MessageCreate, async (message) => {
                 ).values(),
                 ...history,
               ].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-              input = history.map((m) => ({
-                role: m.author.id === client.user!.id ? "assistant" : "user",
-                content:
-                  m.author.id === client.user!.id
-                    ? buildTextFromDiscordMessage(m, prefix)
-                    : buildPartsFromDiscordMessage(m, prefix),
-              })) satisfies OpenAI.Responses.ResponseInput;
             }
           }),
         );
       }
+    } catch (err) {
+      logger.error("Unexpected error:", err);
+      await message.reply(
+        err instanceof Error ? err.message : "An unexpected error occurred.",
+      );
+    } finally {
+      logger.debug("End Processing message");
+      clearInterval(typingInterval);
     }
-  } catch (err) {
-    logger.error("Unexpected error:", err);
-    await message.reply(
-      "An unexpected error occurred. Please try again later.",
-    );
-  } finally {
-    doneCtx = true;
   }
 });
 
