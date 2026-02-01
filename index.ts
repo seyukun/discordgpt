@@ -31,48 +31,6 @@ const client = new Client({
 });
 const openai = new OpenAI();
 
-function buildPartsFromDiscordMessage(
-  m: Message,
-  prefix: string,
-): OpenAI.Responses.ResponseInputContent[] {
-  const parts: any[] = [];
-
-  // テキスト部
-  const text = buildTextFromDiscordMessage(m, prefix);
-
-  parts.push({ type: "input_text", text });
-
-  // 添付（画像 / ファイル）
-  const attachments = [...m.attachments.values()];
-
-  // 画像
-  const images = attachments
-    .filter((a) => (a.contentType ?? "").startsWith("image/"))
-    .slice(0, 10);
-
-  for (const img of images) {
-    parts.push({
-      type: "input_image",
-      image_url: img.url, // Discord CDNのURL
-      // detail: "auto", // 必要なら付与（環境によって必須になるケースあり）
-    });
-  }
-
-  // PDFなどファイル（まずはURL直参照）
-  const files = attachments
-    .filter((a) => !(a.contentType ?? "").startsWith("image/"))
-    .slice(0, 10);
-
-  for (const f of files) {
-    parts.push({
-      type: "input_file",
-      file_url: f.url,
-    });
-  }
-
-  return parts;
-}
-
 function buildTextFromDiscordMessage(m: Message, prefix: string) {
   return [
     `from: ${m.author.displayName}`,
@@ -83,6 +41,34 @@ function buildTextFromDiscordMessage(m: Message, prefix: string) {
   ].join("\n");
 }
 
+function buildPartsFromDiscordMessage(m: Message, prefix: string) {
+  const parts: OpenAI.Responses.ResponseInputContent[] = [];
+
+  parts.push({
+    type: "input_text",
+    text: buildTextFromDiscordMessage(m, prefix),
+  });
+
+  [...m.attachments.values()]
+    .slice(0, 10)
+    .map(
+      (f): OpenAI.Responses.ResponseInputContent =>
+        f.contentType?.startsWith("image/")
+          ? {
+              type: "input_image",
+              image_url: f.url,
+              detail: "auto",
+            }
+          : {
+              type: "input_file",
+              file_url: f.url,
+            },
+    )
+    .forEach((part) => parts.push(part));
+
+  return parts;
+}
+
 client.once(Events.ClientReady, (c) => {
   logger.info(`Ready! Logged in as ${c.user.tag}`);
 });
@@ -91,21 +77,22 @@ client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
   if (!client.user) return;
 
-  let done = false;
+  let doneCtx = false;
 
   try {
     const prefix = `<@${client.user.id}>`;
 
     if (
       message.content.startsWith(prefix) ||
-      (await message.fetchReference())?.author.id === client.user.id
+      (message.reference !== null &&
+        (await message.fetchReference())?.author.id === client.user.id)
     ) {
       (async () => {
         if (client.user === null) return;
         let max = 0;
-        while (!done && max++ < 10000) {
+        while (!doneCtx && max++ < 10000) {
           await message.channel.sendTyping();
-          await sleep(500);
+          await sleep(100);
         }
       })();
 
@@ -146,7 +133,12 @@ client.on(Events.MessageCreate, async (message) => {
       let history = [
         message,
         ...(
-          await message.channel.messages.fetch({ limit: 5, before: message.id })
+          await message.channel.messages.fetch({
+            limit: 5,
+            before: message.reference
+              ? message.reference.messageId
+              : message.id,
+          })
         ).values(),
       ].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
       let input = history.map((m) => ({
@@ -261,7 +253,7 @@ client.on(Events.MessageCreate, async (message) => {
       "An unexpected error occurred. Please try again later.",
     );
   } finally {
-    done = true;
+    doneCtx = true;
   }
 });
 
